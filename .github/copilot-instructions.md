@@ -67,10 +67,10 @@ When helping users create design documents, always reference and guide them thro
 - **API Design**: For any public API changes, require detailed specifications:
   - REST API endpoints with full request/response schemas and status codes
   - CLI command syntax, options, flags, and usage examples
-  - Go interface definitions with method signatures and error handling
   - Management API versioning strategy and backward compatibility plan
   - Kubernetes Custom Resource Definitions (CRDs) and controller interactions
   - SDK interface changes affecting multiple language bindings
+  - Ensures that SDK changes are backward compatible and do not break existing integrations; verify that new SDK features are well-documented and include tests if possible
 
 ### 3. Design Quality
 - **Alternatives**: Always ask users to consider at least one alternative design approach
@@ -109,7 +109,7 @@ Provide tailored guidance and resources based on the folder where the design doc
      - Kubernetes Resource Provider: Handles the logic for managing the Kubernetes resources that will be created for Drasi components.
    - [Drasi CLI](https://github.com/drasi-project/drasi-platform/cli/): The Drasi CLI should provide a command-line interface for interacting with Drasi components and managing queries. If the design involves changes to the CLI, ensure detailed command syntax, options, and examples are provided.
    - [Github Actions Workflows](https://github.com/drasi-project/drasi-platform/.github/workflows/Readme.md): The GitHub Actions workflows should automate the build, test, and deployment processes for Drasi components. If the design involves changes to the workflows, ensure detailed configuration and usage instructions are provided. Look at the Readme for existing workflows and patterns.
-   - [Drasi VS Code Extension](https://github.com/drasi-project/drasi-platform/dev-tols/vscode/): 
+   - [Drasi VS Code Extension](https://github.com/drasi-project/drasi-platform/dev-tols/vscode/)
 
 
 ### e2e-test-framework/
