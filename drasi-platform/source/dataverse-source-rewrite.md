@@ -30,6 +30,7 @@ Key improvements in this rewrite include:
 | Term | Definition |
 |------|------------|
 | Dataverse | Microsoft Dataverse (formerly Common Data Service) - a cloud-based data platform used by Power Platform |
+| Entity | A table in Dataverse that stores data records (e.g., Account, Contact, custom entities) |
 
 ## Objectives
 
