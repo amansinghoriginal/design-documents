@@ -88,6 +88,16 @@ The primary goals of this Dataverse source rewrite are:
      - Understand the structure of lookup field data (e.g., how references to other entities are represented)
      - Determine how lookup fields relate to entity IDs (connection to Goal #2)
      - Explore how lookup values are returned in API responses (navigation properties, expanded data, etc.)
+   - **Examine and handle various Dataverse data types**:
+     - **Choice (OptionSet)**: Single-select picklist values (e.g., Status, Priority)
+     - **Choices (MultiSelectOptionSet)**: Multi-select picklist values
+     - **Date and DateTime**: Timestamp fields with timezone considerations
+     - **Currency and Money**: Monetary values with precision handling
+     - **Lookup**: Single entity references (covered above)
+     - **Boolean (Two Options)**: True/false fields
+     - **Whole Number, Decimal, Floating Point**: Numeric types
+     - Document how each type is serialized and represented in the Drasi data model
+     - Identify any types that require special handling or transformation
    - Design how lookup fields should be represented in Drasi's model:
      - Should lookups become edges/relationships between nodes?
      - How to handle lookup metadata (display name, type information)
@@ -255,9 +265,47 @@ Dataverse does support webhooks through the Plugin Registration system, but they
 
 **Proposed Design**
 
-The source will implement an **adaptive polling strategy with exponential backoff** to balance responsiveness and API efficiency. Each worker will maintain its own polling interval that starts at a minimum value (e.g., 1 second) and doubles on each poll that returns no changes, up to a configurable maximum (e.g., 60 seconds). When the reactivator starts, it will immediately check to see if there are any changes.
+The source will implement an **adaptive polling strategy with two-phase exponential backoff** to balance responsiveness and API efficiency. Each worker will maintain its own polling interval that adjusts based on activity, with different backoff rates optimized for different idle durations.
 
-When changes are detected, the interval immediately resets to the minimum, ensuring fast response during active periods while conserving API quota during quiet periods. Each entity operates independently, so active entities poll frequently while idle entities naturally slow down. HTTP 429 throttling responses will be handled using the `Retry-After` header without affecting the backoff state.
+**Two-Phase Backoff Algorithm:**
+
+**Phase 1: Slow Backoff (< 5 seconds)**
+- **Multiplier**: 1.2x (20% increase per iteration)
+- **Progression**: 500ms → 600ms → 720ms → 864ms → 1,037ms → ... → 5,056ms
+- **Duration**: Takes ~14 iterations and ~30 seconds to reach 5-second threshold
+- **Rationale**: Gentle backoff allows quick response if activity resumes during this phase
+
+**Phase 2: Fast Backoff (≥ 5 seconds)**
+- **Multiplier**: 1.5x (50% increase per iteration)
+- **Progression**: 5,056ms → 7,584ms → 11,376ms → 17,064ms → 25,596ms → 30,000ms (cap)
+- **Duration**: Takes ~5 more iterations to reach 30-second maximum
+- **Rationale**: Aggressive backoff conserves API quota for entities with sustained inactivity
+
+**Total Timeline (500ms min → 30s max):**
+- **~19 total iterations** to reach maximum interval
+- **~50 seconds** elapsed time to reach max
+- **Significantly gentler** in the first 5 seconds compared to pure exponential backoff
+
+**Behavior:**
+- **On startup**: Each worker immediately checks for changes (no initial delay)
+- **On activity**: When changes are detected, interval immediately resets to minimum (500ms), ensuring fast response during active periods
+- **On idle**: Gradual backoff conserves API quota during quiet periods while staying responsive
+- **Independence**: Each entity operates independently, so active entities poll frequently while idle entities naturally slow down
+
+**Configuration Parameters:**
+- `minInterval`: Minimum polling interval (default: 500ms)
+- `maxInterval`: Maximum polling interval calculated dynamically based on entity count
+  - **Formula**: `maxInterval = 30s × √(entityCount)`
+  - **Square root scaling**: Allows natural spreading of polling load as entities increase
+  - **Examples**:
+    - 1 entity: 30s max interval
+    - 5 entities: ~67s max interval (30 × √5 ≈ 67s)
+    - 10 entities: ~95s max interval (30 × √10 ≈ 95s)
+    - 25 entities: ~150s max interval (30 × √25 = 150s)
+  - This value can be overridden by user configuration if desired
+- `phase1Threshold`: Threshold for switching to fast backoff (default: 5s)
+- `phase1Multiplier`: Slow backoff rate (default: 1.2)
+- `phase2Multiplier`: Fast backoff rate (default: 1.5)
 
 
 
