@@ -135,8 +135,8 @@ The updated Dataverse Source will consist of two main components, both refactore
 Both components will share common authentication and configuration logic through the SDK.
 
 **Key Improvements**:
-- **Change Tracking with Adaptive Polling**: Leverages Dataverse's built-in change tracking to retrieve only changed records, combined with adaptive polling intervals to reduce API overhead during quiet periods
-- **Managed Identity**: Leverages Azure managed identity when running in Azure, eliminating credential storage
+- **Change Tracking with Adaptive Polling**: Leverages Dataverse's built-in change tracking to retrieve only changed records, combined with two-phase adaptive polling (slow increase below threshold, fast increase above) to reduce API overhead during quiet periods
+- **Managed Identity**: Leverages Azure managed identity (MicrosoftEntraWorkloadID) when running in Azure, eliminating credential storage
 - **SDK-based Architecture**: Common patterns for configuration, logging, and telemetry provided by the SDK
 
 ### Architecture Diagram
@@ -242,9 +242,9 @@ spec:
   properties:
     instanceUrl: https://myorg.crm.dynamics.com
     
-    # Option 1: Managed Identity (preferred)
+    # Option 1: Managed Identity (preferred) - uses MicrosoftEntraWorkloadID type
     authentication:
-      type: ManagedIdentity
+      type: MicrosoftEntraWorkloadID
       # Optional: specify client ID for user-assigned managed identity
       clientId: "optional-client-id"
     
@@ -260,7 +260,9 @@ spec:
       initialInterval: 5s
       minInterval: 5s
       maxInterval: 300s
-      incrementStep: 10s  # Linear increase step
+      threshold: 60s        # Switch between slow and fast multipliers
+      slowMultiplier: 1.3   # Increase slowly below threshold
+      fastMultiplier: 2.0   # Increase faster above threshold
     
     # Tables to monitor
     tables:
@@ -270,7 +272,7 @@ spec:
 
 #### 2. Adaptive Polling Algorithm
 
-The adaptive polling algorithm balances responsiveness with API efficiency by adjusting the polling interval based on change detection patterns. Instead of using aggressive exponential backoff, the algorithm uses a more gradual linear increase to avoid becoming too slow to respond to changes.
+The adaptive polling algorithm balances responsiveness with API efficiency by adjusting the polling interval based on change detection patterns. It uses a two-phase multiplicative approach: slower growth for shorter intervals and faster growth for longer intervals, providing a balance between quick responsiveness and reduced API calls during extended quiet periods.
 
 **Polling State Machine**:
 ```csharp
@@ -279,14 +281,18 @@ public class AdaptivePollingController
     private TimeSpan _currentInterval;
     private readonly TimeSpan _minInterval;
     private readonly TimeSpan _maxInterval;
-    private readonly TimeSpan _incrementStep;
+    private readonly TimeSpan _threshold;
+    private readonly double _slowMultiplier;  // e.g., 1.2x-1.5x
+    private readonly double _fastMultiplier;  // e.g., 2.0x
     private DateTime _lastChangeDetected;
     
     public AdaptivePollingController(PollingConfig config)
     {
         _minInterval = config.MinInterval;
         _maxInterval = config.MaxInterval;
-        _incrementStep = config.IncrementStep;
+        _threshold = config.Threshold;
+        _slowMultiplier = config.SlowMultiplier;
+        _fastMultiplier = config.FastMultiplier;
         _currentInterval = config.InitialInterval;
     }
     
@@ -300,10 +306,14 @@ public class AdaptivePollingController
         }
         else
         {
-            // Linear increase up to max interval (less aggressive than exponential)
+            // Two-phase multiplicative increase
+            double multiplier = _currentInterval < _threshold 
+                ? _slowMultiplier  // Below threshold: increase slowly (e.g., 1.2x-1.5x)
+                : _fastMultiplier; // Above threshold: increase faster (e.g., 2.0x)
+            
             _currentInterval = TimeSpan.FromSeconds(
                 Math.Min(
-                    _currentInterval.TotalSeconds + _incrementStep.TotalSeconds,
+                    _currentInterval.TotalSeconds * multiplier,
                     _maxInterval.TotalSeconds
                 )
             );
@@ -321,7 +331,7 @@ public class AdaptivePollingController
    - Update change token
    - Reset polling interval to minimum
 3. If no changes:
-   - Increase polling interval using backoff multiplier
+   - Increase polling interval using two-phase multiplier (slow below threshold, fast above)
    - Wait for next interval
 
 #### 3. SDK Integration
@@ -329,66 +339,99 @@ public class AdaptivePollingController
 The Dataverse Source will use the [Drasi.Source.SDK NuGet package (v0.1.8-alpha)](https://www.nuget.org/packages/Drasi.Source.SDK/0.1.8-alpha) to ensure consistency with other Drasi sources.
 
 **Reactivator Implementation**:
+
+To build a reactivator, implement `IChangeMonitor` which returns an `IAsyncEnumerable<ChangeNotification>` that yields changes when they occur in the data source.
+
 ```csharp
-public class DataverseReactivator : SourceReactivator
+public class DataverseChangeMonitor : IChangeMonitor
 {
-    private readonly IDataverseAuthProvider _authProvider;
+    private readonly DataverseChangeTracker _changeTracker;
     private readonly AdaptivePollingController _pollingController;
     private readonly ILogger _logger;
     
-    protected override async Task ProcessChangesAsync(CancellationToken ct)
+    public async IAsyncEnumerable<ChangeNotification> GetChanges(
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        var client = await _authProvider.GetAuthenticatedClientAsync();
-        
-        while (!ct.IsCancellationRequested)
+        while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
-                var changes = await DetectChangesAsync(client);
-                var hasChanges = changes.Any();
+                var changeSet = await _changeTracker.RetrieveChangesAsync();
+                var hasChanges = changeSet.NewOrUpdatedEntities.Any() || 
+                                 changeSet.RemovedOrDeletedEntityReferences.Any();
                 
                 if (hasChanges)
                 {
-                    await PublishChangesAsync(changes);
+                    // Yield all changes
+                    foreach (var entity in changeSet.NewOrUpdatedEntities)
+                    {
+                        yield return CreateChangeNotification(entity);
+                    }
+                    
+                    foreach (var deleted in changeSet.RemovedOrDeletedEntityReferences)
+                    {
+                        yield return CreateDeleteNotification(deleted);
+                    }
                 }
                 
                 var nextInterval = _pollingController.GetNextInterval(hasChanges);
-                await Task.Delay(nextInterval, ct);
+                await Task.Delay(nextInterval, cancellationToken);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error detecting changes");
-                await Task.Delay(_pollingController.GetNextInterval(false), ct);
+                await Task.Delay(_pollingController.GetNextInterval(false), cancellationToken);
             }
         }
     }
 }
+
+// Build and start the reactivator
+var reactivator = new SourceReactivatorBuilder()
+    .UseChangeMonitor<DataverseChangeMonitor>()
+    .Build();
+
+await reactivator.StartAsync();
 ```
 
 **Proxy Implementation**:
+
+To implement a proxy, implement `IBootstrapHandler` which will be invoked when a new query bootstraps. The request will hold the element labels the query is interested in and an `IAsyncEnumerable<SourceNode>` must be returned.
+
 ```csharp
-public class DataverseProxy : SourceProxy
+public class DataverseBootstrapHandler : IBootstrapHandler
 {
     private readonly IDataverseAuthProvider _authProvider;
+    private readonly DataTypeValueExtractor _valueExtractor;
     
-    protected override async Task<IEnumerable<Node>> GetNodesAsync(
-        string nodeType, 
-        CancellationToken ct)
+    public async IAsyncEnumerable<SourceNode> GetBootstrapData(
+        BootstrapRequest request,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var client = await _authProvider.GetAuthenticatedClientAsync();
         
-        // Convert node type to Dataverse table name
-        var tableName = MapNodeTypeToTable(nodeType);
-        
-        // Build and execute FetchXML query
-        var fetchXml = BuildFetchXmlQuery(tableName);
-        var results = await client.RetrieveMultipleAsync(
-            new FetchExpression(fetchXml));
-        
-        // Convert entities to nodes with lookup resolution
-        return await ConvertEntitiesToNodesAsync(results.Entities);
+        foreach (var label in request.Labels)
+        {
+            var tableName = MapLabelToTable(label);
+            var fetchXml = BuildFetchXmlQuery(tableName);
+            var results = await client.RetrieveMultipleAsync(
+                new FetchExpression(fetchXml));
+            
+            foreach (var entity in results.Entities)
+            {
+                var node = await _valueExtractor.ConvertEntityToNodeAsync(entity);
+                yield return node;
+            }
+        }
     }
 }
+
+// Build and start the proxy
+var proxy = new SourceProxyBuilder()
+    .UseBootstrapHandler<DataverseBootstrapHandler>()
+    .Build();
+
+await proxy.StartAsync();
 ```
 
 #### 4. Complex Data Type Handling
@@ -505,11 +548,11 @@ public class DataverseChangeTracker
 
 #### Advantages of this design
 - **Security**: Managed identity eliminates credential storage and rotation concerns
-- **Performance**: Dataverse change tracking combined with adaptive polling significantly reduces API calls during quiet periods
+- **Performance**: Dataverse change tracking combined with two-phase adaptive polling significantly reduces API calls during quiet periods while maintaining responsiveness
 - **Accuracy**: Native change tracking ensures no changes are missed and deleted records are properly detected
 - **Maintainability**: SDK integration ensures consistency with other sources and reduces code duplication
 - **Extensibility**: Data type extraction pattern can be easily extended to support additional Dataverse types
-- **Flexibility**: Configuration allows tuning for different environments and requirements
+- **Flexibility**: Two-phase polling algorithm balances responsiveness at short intervals with efficiency at longer intervals
 
 #### Disadvantages
 - **Complexity**: Adaptive polling and change tracking add state management complexity
@@ -522,14 +565,14 @@ public class DataverseChangeTracker
 
 **Configuration API Changes**:
 
-The source configuration schema will be extended to support authentication options:
+The source configuration schema will be extended to support authentication options. Note that `MicrosoftEntraWorkloadID` is already a supported authentication type in Drasi, so managed identity can be configured using that type.
 
 ```yaml
-# New authentication section
+# Authentication section
 authentication:
-  type: ManagedIdentity | ServicePrincipal
+  type: MicrosoftEntraWorkloadID | ServicePrincipal
   
-  # For ManagedIdentity
+  # For MicrosoftEntraWorkloadID (Managed Identity)
   clientId?: string  # Optional: user-assigned managed identity
   
   # For ServicePrincipal (existing)
@@ -537,12 +580,14 @@ authentication:
   clientSecret?: string
   tenantId?: string
 
-# New polling configuration section
+# Polling configuration section
 polling:
   initialInterval: duration    # e.g., "5s", "1m"
   minInterval: duration         # Minimum polling interval
   maxInterval: duration         # Maximum polling interval
-  incrementStep: duration       # Linear increase step (e.g., "10s")
+  threshold: duration           # Threshold for switching multipliers
+  slowMultiplier: number        # Multiplier below threshold (e.g., 1.3)
+  fastMultiplier: number        # Multiplier above threshold (e.g., 2.0)
 ```
 
 **CLI Impact**:
@@ -552,22 +597,6 @@ No CLI command changes are required. The existing `drasi apply` command will sup
 Example:
 ```bash
 drasi apply -f dataverse-source.yaml
-```
-
-**SDK API Extensions**:
-
-If the current .NET Source SDK doesn't support custom authentication providers, we may need to extend it:
-
-```csharp
-// Potential SDK extension
-public abstract class SourceReactivator
-{
-    // Add support for custom authentication
-    protected virtual Task<IAuthenticationProvider> GetAuthenticationProviderAsync()
-    {
-        // Default implementation
-    }
-}
 ```
 
 ### Alternatives Considered
@@ -667,6 +696,8 @@ public abstract class SourceReactivator
 
 ### Breaking Changes
 
+This is a complete rewrite of the Dataverse Source, so backward compatibility is not maintained:
+
 1. **Configuration Schema**: The authentication configuration format is new and incompatible with the existing format
    - **Migration Path**: Provide documentation and examples for converting old configuration to new format
    - **Tool Support**: Consider providing a configuration migration script
@@ -675,22 +706,7 @@ public abstract class SourceReactivator
    - **Impact**: Existing continuous queries may need updates if they reference lookup fields
    - **Mitigation**: Document the new format and provide query migration examples
 
-### Backward Compatibility
-
-**Preserved**:
-- Query interface remains the same (users don't need to change continuous queries except for lookup handling)
-- Deployment model unchanged (still deployed as standard Drasi source)
-- Existing service principal authentication supported as fallback
-
-**Not Preserved**:
-- Configuration file format requires updates
-- Internal change detection mechanism is completely different
-
-**Migration Strategy**:
-1. Document configuration differences
-2. Provide side-by-side configuration examples
-3. Consider supporting a "legacy" mode temporarily if needed
-4. Update all tutorial and sample configurations
+3. **Change Tracking Requirement**: Requires change tracking to be enabled on Dataverse tables by administrators
 
 ## Supportability
 
@@ -726,14 +742,15 @@ public abstract class SourceReactivator
 - Authentication provider tests (managed identity and service principal)
 - Adaptive polling algorithm tests with various change patterns
 - Data type value extraction tests (lookup, currency, choice)
-- Dataverse change tracking integration tests
+- JSON mapping tests for converting Dataverse entities to Drasi nodes
 - Configuration parsing and validation tests
 
 **Integration Tests**:
-- End-to-end test with test Dataverse instance
+- JSON mapping validation with sample Dataverse entity payloads (no live Dataverse required)
+- Mock Dataverse change tracking responses to test change detection logic
 - Authentication with managed identity (in Azure environment)
 - Authentication with service principal
-- Change tracking with Dataverse RetrieveEntityChanges API
+- Change tracking with Dataverse RetrieveEntityChanges API (requires live Dataverse)
 - Change detection across different intervals
 - Complex data type handling (lookup, currency, choice)
 - Error handling and recovery
@@ -893,7 +910,9 @@ spec:
       initialInterval: 30s
       minInterval: 5s
       maxInterval: 300s
-      incrementStep: 10s
+      threshold: 60s
+      slowMultiplier: 1.3
+      fastMultiplier: 2.0
 ```
 
 ## References
