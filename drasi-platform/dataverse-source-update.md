@@ -38,15 +38,15 @@ These updates will make the Dataverse Source more secure, efficient, and easier 
 
 **Scenario 3: Complex Data Modeling**
 - **Persona**: Business Application Developer
-- **Goal**: Create continuous queries that involve related Dataverse entities
-- **Requirements**: The developer needs to query and track changes across entities with lookup relationships
+- **Goal**: Create continuous queries that work with Dataverse entities containing lookup fields
+- **Requirements**: The developer needs to query and track changes in entities that have lookup fields, with the lookup values properly extracted and available in queries
 
 ### Goals
 
 - **Security Enhancement**: Implement managed identity authentication to eliminate the need to store credentials, improving security posture
 - **SDK Migration**: Migrate to the Drasi .NET Source SDK to ensure consistency with other sources and leverage common functionality
 - **Performance Optimization**: Implement an adaptive polling algorithm that reduces API calls during quiet periods while maintaining responsiveness during active periods
-- **Data Type Support**: Add support for the Dataverse lookup data type to enable queries across related entities
+- **Data Type Support**: Add support for Dataverse lookup and other complex data types (currency, choice/picklist) with proper value extraction
 - **Documentation**: Provide comprehensive documentation for configuration, authentication options, and data type handling
 
 ### Non-Goals
@@ -67,8 +67,8 @@ These updates will make the Dataverse Source more secure, efficient, and easier 
 1. Support authentication via Azure Managed Identity
 2. Maintain support for existing service principal authentication as a fallback
 3. Use the Drasi .NET Source SDK for both proxy and reactivator components
-4. Implement an adaptive polling algorithm that adjusts based on change frequency
-5. Handle Dataverse lookup data types correctly in both initial load and change detection
+4. Implement an adaptive polling algorithm that adjusts based on change frequency using Dataverse's native change tracking capability
+5. Handle Dataverse complex data types (lookup, currency, choice/picklist) correctly in both initial load and change detection by extracting their values
 6. Provide clear error messages for authentication and configuration issues
 
 **Non-Functional Requirements**:
@@ -102,14 +102,14 @@ These updates will make the Dataverse Source more secure, efficient, and easier 
 - Resource provider should support deploying sources with managed identity configuration
 
 **Build and Release Pipelines**:
-- GitHub Actions workflows must be updated to build and test the updated Dataverse source
-- Both `build-test` and `draft-release` workflows need updates
+- GitHub Actions workflows are already configured to build and publish the Dataverse source
+- May need to update the `default-source-provider` file if new environment variables are introduced
 
 ### Out of scope
 
-**Real-time Change Feed**: Dataverse does not currently provide a native change feed or push notification mechanism, so this design will continue using polling. Future Dataverse platform updates may enable this.
+**Real-time Change Feed**: While Dataverse provides change tracking capabilities for incremental synchronization, it does not offer real-time push notifications. This design leverages Dataverse's change tracking API (see [Use change tracking](https://learn.microsoft.com/en-us/power-apps/developer/data-platform/use-change-tracking-synchronize-data-external-systems)) with adaptive polling to efficiently detect changes.
 
-**Complete Data Type Coverage**: While lookup types are critical, supporting all Dataverse data types (OptionSet, MultiSelectOptionSet, Customer, etc.) is deferred to future iterations.
+**Complete Data Type Coverage**: This design focuses on the most common complex data types (lookup, currency, choice/picklist). Supporting all Dataverse data types (e.g., Customer, Owner, PartyList, etc.) is deferred to future iterations.
 
 **Multi-tenant Authentication**: This design focuses on single-tenant scenarios. Multi-tenant authentication patterns are not addressed.
 
@@ -122,20 +122,20 @@ These updates will make the Dataverse Source more secure, efficient, and easier 
 The updated Dataverse Source will consist of two main components, both refactored to use the Drasi .NET Source SDK:
 
 1. **Dataverse Reactivator**: Responsible for detecting changes in Dataverse and publishing them to the Drasi query container
-   - Uses adaptive polling algorithm to check for changes
+   - Uses Dataverse's native change tracking API with adaptive polling to efficiently detect changes
    - Authenticates using managed identity or service principal
-   - Tracks change tokens to detect incremental changes
-   - Handles lookup type expansion
+   - Tracks change tokens from Dataverse change tracking to retrieve only new/modified/deleted records
+   - Extracts lookup, currency, and choice values from entity attributes
 
 2. **Dataverse Proxy**: Provides initial data snapshots and handles node queries
    - Authenticates using the same mechanism as reactivator
-   - Translates Drasi queries to Dataverse FetchXML queries
-   - Resolves lookup relationships during initial load
+   - Executes FetchXML queries against Dataverse tables
+   - Extracts complex data type values (lookup, currency, choice) during initial load
 
 Both components will share common authentication and configuration logic through the SDK.
 
 **Key Improvements**:
-- **Adaptive Polling**: Instead of a fixed interval, the system will use an exponential backoff when no changes are detected, with a configurable minimum and maximum interval
+- **Change Tracking with Adaptive Polling**: Leverages Dataverse's built-in change tracking to retrieve only changed records, combined with adaptive polling intervals to reduce API overhead during quiet periods
 - **Managed Identity**: Leverages Azure managed identity when running in Azure, eliminating credential storage
 - **SDK-based Architecture**: Common patterns for configuration, logging, and telemetry provided by the SDK
 
@@ -260,7 +260,7 @@ spec:
       initialInterval: 5s
       minInterval: 5s
       maxInterval: 300s
-      backoffMultiplier: 2.0
+      incrementStep: 10s  # Linear increase step
     
     # Tables to monitor
     tables:
@@ -270,6 +270,8 @@ spec:
 
 #### 2. Adaptive Polling Algorithm
 
+The adaptive polling algorithm balances responsiveness with API efficiency by adjusting the polling interval based on change detection patterns. Instead of using aggressive exponential backoff, the algorithm uses a more gradual linear increase to avoid becoming too slow to respond to changes.
+
 **Polling State Machine**:
 ```csharp
 public class AdaptivePollingController
@@ -277,14 +279,14 @@ public class AdaptivePollingController
     private TimeSpan _currentInterval;
     private readonly TimeSpan _minInterval;
     private readonly TimeSpan _maxInterval;
-    private readonly double _backoffMultiplier;
+    private readonly TimeSpan _incrementStep;
     private DateTime _lastChangeDetected;
     
     public AdaptivePollingController(PollingConfig config)
     {
         _minInterval = config.MinInterval;
         _maxInterval = config.MaxInterval;
-        _backoffMultiplier = config.BackoffMultiplier;
+        _incrementStep = config.IncrementStep;
         _currentInterval = config.InitialInterval;
     }
     
@@ -298,10 +300,10 @@ public class AdaptivePollingController
         }
         else
         {
-            // Exponential backoff up to max interval
+            // Linear increase up to max interval (less aggressive than exponential)
             _currentInterval = TimeSpan.FromSeconds(
                 Math.Min(
-                    _currentInterval.TotalSeconds * _backoffMultiplier,
+                    _currentInterval.TotalSeconds + _incrementStep.TotalSeconds,
                     _maxInterval.TotalSeconds
                 )
             );
@@ -323,6 +325,8 @@ public class AdaptivePollingController
    - Wait for next interval
 
 #### 3. SDK Integration
+
+The Dataverse Source will use the [Drasi.Source.SDK NuGet package (v0.1.8-alpha)](https://www.nuget.org/packages/Drasi.Source.SDK/0.1.8-alpha) to ensure consistency with other Drasi sources.
 
 **Reactivator Implementation**:
 ```csharp
@@ -387,15 +391,45 @@ public class DataverseProxy : SourceProxy
 }
 ```
 
-#### 4. Lookup Type Handling
+#### 4. Complex Data Type Handling
 
-**Lookup Resolution**:
+**Data Type Value Extraction**:
 ```csharp
-public class LookupResolver
+public class DataTypeValueExtractor
 {
-    private readonly ServiceClient _client;
+    public object ExtractValue(string attributeName, object attributeValue)
+    {
+        return attributeValue switch
+        {
+            // Extract lookup value - store the referenced entity details
+            EntityReference lookup => new
+            {
+                Id = lookup.Id.ToString(),
+                LogicalName = lookup.LogicalName,
+                Name = lookup.Name ?? string.Empty
+            },
+            
+            // Extract money/currency value
+            Money money => money.Value,
+            
+            // Extract choice/picklist value (OptionSetValue)
+            OptionSetValue choice => new
+            {
+                Value = choice.Value,
+                // Label can be retrieved from metadata if needed
+            },
+            
+            // Extract multi-select choice value
+            OptionSetValueCollection multiChoice => multiChoice
+                .Select(o => o.Value)
+                .ToArray(),
+            
+            // Default: return as-is
+            _ => attributeValue
+        };
+    }
     
-    public async Task<Node> ResolveLookupsAsync(Entity entity)
+    public async Task<Node> ConvertEntityToNodeAsync(Entity entity)
     {
         var node = new Node
         {
@@ -405,20 +439,7 @@ public class LookupResolver
         
         foreach (var attribute in entity.Attributes)
         {
-            if (attribute.Value is EntityReference lookup)
-            {
-                // Store lookup as a relationship edge
-                node.Properties[attribute.Key] = new
-                {
-                    Id = lookup.Id.ToString(),
-                    LogicalName = lookup.LogicalName,
-                    Name = lookup.Name
-                };
-            }
-            else
-            {
-                node.Properties[attribute.Key] = attribute.Value;
-            }
+            node.Properties[attribute.Key] = ExtractValue(attribute.Key, attribute.Value);
         }
         
         return node;
@@ -426,58 +447,76 @@ public class LookupResolver
 }
 ```
 
-**Change Token Management**:
+**Dataverse Change Tracking Integration**:
 ```csharp
-public class ChangeTokenManager
+public class DataverseChangeTracker
 {
-    private Dictionary<string, string> _tableTokens = new();
+    private readonly ServiceClient _client;
+    private Dictionary<string, string> _tableVersions = new();
     
-    public async Task<EntityCollection> GetChangesAsync(
-        ServiceClient client, 
-        string tableName)
+    public async Task<ChangeSet> RetrieveChangesAsync(string tableName)
     {
-        var fetchXml = BuildChangeTrackingQuery(
-            tableName, 
-            _tableTokens.GetValueOrDefault(tableName));
-        
-        var results = await client.RetrieveMultipleAsync(
-            new FetchExpression(fetchXml));
-        
-        // Update token from response
-        if (results.EntityName != null)
+        // Use Dataverse's RetrieveEntityChanges API
+        var request = new RetrieveEntityChangesRequest
         {
-            _tableTokens[tableName] = results.PagingCookie;
-        }
+            EntityName = tableName,
+            Columns = new ColumnSet(allColumns: true),
+            DataVersion = _tableVersions.GetValueOrDefault(tableName)
+        };
         
-        return results;
+        var response = (RetrieveEntityChangesResponse)await _client.ExecuteAsync(request);
+        
+        // Update version token for next retrieval
+        _tableVersions[tableName] = response.EntityChanges.DataToken;
+        
+        var changeSet = new ChangeSet
+        {
+            NewOrUpdatedEntities = response.EntityChanges.Changes
+                .OfType<NewOrUpdatedItem>()
+                .Select(c => c.NewOrUpdatedEntity)
+                .ToList(),
+                
+            RemovedOrDeletedEntityReferences = response.EntityChanges.Changes
+                .OfType<RemovedOrDeletedItem>()
+                .Select(c => c.RemovedItem)
+                .ToList(),
+                
+            HasMoreRecords = response.EntityChanges.MoreRecords,
+            PagingCookie = response.EntityChanges.PagingCookie
+        };
+        
+        return changeSet;
     }
     
-    private string BuildChangeTrackingQuery(string tableName, string token)
+    public bool IsChangeTrackingEnabled(string tableName)
     {
-        // Use Dataverse change tracking capabilities
-        return $@"
-            <fetch version='1.0' output-format='xml-platform' mapping='logical'>
-              <entity name='{tableName}'>
-                <all-attributes />
-                {(token != null ? $"<filter type='and'><condition attribute='modifiedon' operator='gt' value='{token}' /></filter>" : "")}
-              </entity>
-            </fetch>";
+        // Query entity metadata to verify change tracking is enabled
+        var request = new RetrieveEntityRequest
+        {
+            LogicalName = tableName,
+            EntityFilters = EntityFilters.Entity
+        };
+        
+        var response = (RetrieveEntityResponse)_client.Execute(request);
+        return response.EntityMetadata.ChangeTrackingEnabled ?? false;
     }
 }
 ```
 
 #### Advantages of this design
 - **Security**: Managed identity eliminates credential storage and rotation concerns
-- **Performance**: Adaptive polling reduces API calls significantly during quiet periods
+- **Performance**: Dataverse change tracking combined with adaptive polling significantly reduces API calls during quiet periods
+- **Accuracy**: Native change tracking ensures no changes are missed and deleted records are properly detected
 - **Maintainability**: SDK integration ensures consistency with other sources and reduces code duplication
-- **Extensibility**: Lookup handling pattern can be extended to other complex types
+- **Extensibility**: Data type extraction pattern can be easily extended to support additional Dataverse types
 - **Flexibility**: Configuration allows tuning for different environments and requirements
 
 #### Disadvantages
-- **Complexity**: Adaptive polling adds state management complexity
+- **Complexity**: Adaptive polling and change tracking add state management complexity
 - **Azure Dependency**: Managed identity works best in Azure environments (though service principal remains available)
 - **Migration**: Existing deployments will need configuration updates
-- **Testing**: Adaptive polling behavior requires comprehensive testing across different change patterns
+- **Change Tracking Setup**: Requires change tracking to be enabled on Dataverse tables (must be configured by administrators)
+- **Testing**: Adaptive polling and change tracking behavior requires comprehensive testing across different change patterns
 
 ### API Design
 
@@ -503,7 +542,7 @@ polling:
   initialInterval: duration    # e.g., "5s", "1m"
   minInterval: duration         # Minimum polling interval
   maxInterval: duration         # Maximum polling interval
-  backoffMultiplier: number     # Multiplier for backoff (e.g., 2.0)
+  incrementStep: duration       # Linear increase step (e.g., "10s")
 ```
 
 **CLI Impact**:
@@ -662,48 +701,53 @@ public abstract class SourceReactivator
 - `dataverse_changes_detected_total`: Count of polling cycles with changes (counter)
 - `dataverse_api_calls_total`: Total API calls to Dataverse (counter)
 - `dataverse_authentication_failures_total`: Authentication failure count (counter)
-- `dataverse_lookup_resolutions_total`: Lookup resolution count (counter)
+- `dataverse_data_type_extractions_total`: Data type value extraction count by type (counter)
 - `dataverse_entities_processed_total`: Total entities processed (counter)
+- `dataverse_change_tracking_version`: Current change tracking version/token by table (gauge)
 
 **Logs to Generate**:
 - Authentication method used and success/failure
 - Polling interval adjustments and reasons
 - Change detection results (summary, not full data)
-- Lookup resolution operations
+- Change tracking status and version updates
+- Data type extraction operations
 - Configuration validation errors
 - API errors and retry attempts
 
 **Traces**:
 - End-to-end request tracing for change detection
 - Authentication flow tracing
-- Lookup resolution tracing
+- Data type value extraction tracing
+- Change tracking API request tracing
 
 ### Verification
 
 **Unit Tests**:
 - Authentication provider tests (managed identity and service principal)
 - Adaptive polling algorithm tests with various change patterns
-- Lookup resolution logic tests
+- Data type value extraction tests (lookup, currency, choice)
+- Dataverse change tracking integration tests
 - Configuration parsing and validation tests
 
 **Integration Tests**:
 - End-to-end test with test Dataverse instance
 - Authentication with managed identity (in Azure environment)
 - Authentication with service principal
+- Change tracking with Dataverse RetrieveEntityChanges API
 - Change detection across different intervals
-- Lookup relationship handling
+- Complex data type handling (lookup, currency, choice)
 - Error handling and recovery
 
 **E2E Tests**:
 - Deploy source with managed identity in Azure Kubernetes Service
 - Deploy source with service principal in any Kubernetes cluster
-- Verify initial data load with lookups
-- Verify change detection and publication
+- Verify initial data load with complex data types
+- Verify change detection using Dataverse change tracking
 - Verify adaptive polling behavior over time
 - Test configuration updates and source restart
 
 **Performance Tests**:
-- Measure API call reduction with adaptive polling
+- Measure API call reduction with adaptive polling and change tracking
 - Initial load performance with large datasets
 - Change processing latency
 - Resource consumption (CPU, memory)
@@ -724,19 +768,20 @@ public abstract class SourceReactivator
 - Add authentication tests
 - **Deliverable**: Source supporting both managed identity and service principal
 
-### Phase 3: Adaptive Polling (1 week)
-- Implement AdaptivePollingController
-- Add polling configuration schema
-- Add telemetry for polling behavior
-- Add polling algorithm tests
-- **Deliverable**: Source with adaptive polling enabled
+### Phase 3: Dataverse Change Tracking Integration (1.5 weeks)
+- Implement DataverseChangeTracker using RetrieveEntityChanges API
+- Add change tracking validation and error handling
+- Integrate adaptive polling with change tracking
+- Add telemetry for change detection
+- Add change tracking tests
+- **Deliverable**: Source using native Dataverse change tracking with adaptive polling
 
-### Phase 4: Lookup Type Support (1 week)
-- Implement LookupResolver
-- Update initial load to resolve lookups
-- Update change detection to handle lookup changes
-- Add lookup handling tests
-- **Deliverable**: Source with full lookup support
+### Phase 4: Complex Data Type Support (1.5 weeks)
+- Implement DataTypeValueExtractor for lookup, currency, and choice types
+- Update initial load to extract data type values
+- Update change detection to handle data type values
+- Add data type handling tests
+- **Deliverable**: Source with full support for lookup, currency, and choice data types
 
 ### Phase 5: Integration and Testing (1 week)
 - Integration testing with real Dataverse instance
@@ -746,27 +791,27 @@ public abstract class SourceReactivator
 - **Deliverable**: Production-ready source
 
 ### Phase 6: Build Pipeline Updates (0.5 weeks)
-- Update `build-test` workflow
-- Update `draft-release` workflow
-- Test automated builds and releases
+- Update `default-source-provider` file if new environment variables are needed
+- Test automated builds and releases with existing workflows
 - **Deliverable**: Automated CI/CD for updated source
 
-**Total Estimated Effort**: 6.5 weeks
+**Total Estimated Effort**: 7.5 weeks
 
 ### Work Items
 1. SDK migration for reactivator
 2. SDK migration for proxy
 3. Managed identity authentication implementation
 4. Service principal fallback implementation
-5. Adaptive polling algorithm implementation
-6. Lookup type resolver implementation
-7. Configuration schema updates
-8. Unit test suite
-9. Integration test suite
-10. E2E test suite
-11. Documentation updates
-12. Build pipeline updates
-13. Sample configurations and tutorials
+5. Dataverse change tracking integration using RetrieveEntityChanges API
+6. Adaptive polling algorithm implementation
+7. Data type value extractor implementation (lookup, currency, choice)
+8. Configuration schema updates
+9. Unit test suite
+10. Integration test suite
+11. E2E test suite
+12. Documentation updates
+13. Build pipeline updates (if needed for environment variables)
+14. Sample configurations and tutorials
 
 ## Open issues
 
@@ -776,15 +821,15 @@ public abstract class SourceReactivator
 
 **Q2: What should the default polling intervals be?**
 - **Discussion**: Need to balance responsiveness vs API costs. Different environments may have different needs.
-- **Recommendation**: Start with conservative defaults (min: 5s, max: 5m, initial: 30s) and allow configuration
+- **Recommendation**: Start with conservative defaults (min: 5s, max: 5m, initial: 30s, increment: 10s) and allow configuration
 
-**Q3: How should we handle lookup chains (lookup to lookup)?**
-- **Discussion**: Should we resolve nested lookups automatically, require explicit configuration, or limit to one level?
-- **Recommendation**: Start with single-level lookups, add configuration for depth in future if needed
+**Q3: How should we handle tables where change tracking is not enabled?**
+- **Discussion**: Change tracking must be enabled on Dataverse tables by administrators. Should we fall back to polling all records or fail with an error?
+- **Recommendation**: Validate at startup and provide clear error messages directing users to enable change tracking. Include links to documentation.
 
-**Q4: Should we implement any caching for lookup resolutions?**
-- **Discussion**: Caching could reduce API calls but adds complexity and staleness concerns.
-- **Recommendation**: No caching in initial implementation; revisit based on performance metrics
+**Q4: Should we implement any caching for choice/picklist labels?**
+- **Discussion**: Choice labels are retrieved from metadata. Caching could reduce API calls but adds complexity and staleness concerns.
+- **Recommendation**: No caching in initial implementation; store only the numeric value. Revisit based on performance metrics if label resolution is needed.
 
 **Q5: How should we handle Dataverse throttling?**
 - **Discussion**: Dataverse has API rate limits. Should we implement backoff or rely on SDK built-in handling?
@@ -794,15 +839,27 @@ public abstract class SourceReactivator
 - **Discussion**: If SDK lacks features, should we extend it or implement workarounds in the source?
 - **Recommendation**: Extend SDK when features are generally useful, workaround for Dataverse-specific needs
 
+**Q7: How should we handle large change sets that exceed paging limits?**
+- **Discussion**: Dataverse change tracking supports paging. Should we process all pages in one cycle or spread across multiple polling intervals?
+- **Recommendation**: Process all pages in a single cycle to maintain consistency, with configurable timeout for very large change sets
+
 ## Appendices
 
 ### Appendix A: Dataverse Change Tracking Overview
 
-Dataverse provides change tracking capabilities that maintain a history of data changes. The change tracking feature:
+Dataverse provides native change tracking capabilities through the `RetrieveEntityChanges` API that maintain a history of data changes. The change tracking feature:
 - Tracks create, update, and delete operations
-- Provides a change token (paging cookie) to query incremental changes
+- Provides a data version token to query incremental changes since the last request
 - Retains changes for a configurable retention period (default 90 days)
-- Works with FetchXML or Web API queries
+- Returns both the changed entities and information about deleted entities
+- Must be explicitly enabled on each table by administrators (see [Enable change tracking](https://learn.microsoft.com/en-us/power-platform/admin/enable-change-tracking-control-data-synchronization))
+- Works with the Web API through the `RetrieveEntityChanges` function
+
+Key benefits over polling-based approaches:
+- Only retrieves changed records, not all records
+- Detects deletions that would otherwise be missed
+- Provides guaranteed consistency through version tokens
+- More efficient use of API calls and bandwidth
 
 ### Appendix B: Sample Configuration Migration
 
@@ -836,14 +893,15 @@ spec:
       initialInterval: 30s
       minInterval: 5s
       maxInterval: 300s
-      backoffMultiplier: 2.0
+      incrementStep: 10s
 ```
 
 ## References
 
 1. [Drasi Platform Repository](https://github.com/drasi-project/drasi-platform)
-2. [Drasi .NET Source SDK](https://github.com/drasi-project/drasi-platform/tree/main/sources/sdk/dotnet)
+2. [Drasi .NET Source SDK (NuGet)](https://www.nuget.org/packages/Drasi.Source.SDK/0.1.8-alpha)
 3. [Microsoft Dataverse Web API Reference](https://docs.microsoft.com/en-us/power-apps/developer/data-platform/webapi/overview)
 4. [Azure Managed Identity Documentation](https://docs.microsoft.com/en-us/azure/active-directory/managed-identities-azure-resources/overview)
-5. [Dataverse Change Tracking](https://docs.microsoft.com/en-us/power-apps/developer/data-platform/use-change-tracking-synchronize-data-external-systems)
-6. [Issue #338: Update the Dataverse Source](https://github.com/drasi-project/drasi-platform/issues/338)
+5. [Use change tracking to synchronize data with external systems](https://learn.microsoft.com/en-us/power-apps/developer/data-platform/use-change-tracking-synchronize-data-external-systems)
+6. [Enable change tracking to control data synchronization](https://learn.microsoft.com/en-us/power-platform/admin/enable-change-tracking-control-data-synchronization)
+7. [Issue #338: Update the Dataverse Source](https://github.com/drasi-project/drasi-platform/issues/338)
