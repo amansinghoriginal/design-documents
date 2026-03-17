@@ -29,7 +29,7 @@ There is no mechanism to determine "what has this index already processed?" and 
 
 Following are some design goals we are aiming for. Some of them might need to be compromised partly depending on the implementation of the specific changes.
 
-1. **Exactly once processing** - Every source event will be processed exactly once by the query engine when it uses a persistent index.
+1. **At Least Once processing** - Every source event will be processed exactly once by the query engine when it uses a persistent index. For Transient sources like HTTP that retry without getting ACK, the same incoming event might be processed more than once.
 2. **Minimal overhead for volatile queries** - Queries using in-memory indexes should ideally have zero overhead - no sequence tracking, no checkpoint writes and no behavioral changes.
 3. **Minimal cost on hot-path** - One extra key-value write per source-change event processed. This too will piggy-back on an already-open RocksDB/Garnet transaction. No extra `fsync`.
 4. **Source-agnostic protocol** - The recovery protocol should work uniformly for log-tailing sources (Postgres, Kafka) and transient sources (HTTP, gRPC) with an optional local WAL.
