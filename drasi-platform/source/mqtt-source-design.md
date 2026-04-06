@@ -262,6 +262,53 @@ sensor-2 -> L2
 Pros: zero config.
 Cons: lower query readability and weaker domain semantics.
 
+##### Option D: Pattern Based Matching
+This provides a flexible Domain Specific Language (DSL) that uses Template Variables to extract metadata from the topic and determines how the JSON payload updates the graph.
+
+
+it will have 4 sections
+- `pattern`: Users define topic structures using {variable} placeholders (e.g., {building}/{floor}/sensor/{id}). The source extracts these segments to use as node IDs, labels, or properties.
+
+1. `entity`: contains the `label` and the `id` patterns for the main node that contains data.
+2. `properties`: contains ingestion modes and contains 3 options.
+`payload_as_field` and `field_name`: Use when the topic segment (e.g., {attribute}) defines the property name and the payload is a single value.
+
+`payload_spread`: Use when the payload is a JSON object; the source flattens all keys directly into the Drasi node properties.
+
+`inject`: (can be used with any of the `payload_as_field` or `payload_spread` options) Allows the user to manually insert topic variables (like {floor}) into the node's properties alongside the payload data for better query context.
+
+3. `nodes`: to define the hierarchical parent nodes used in relations, where every nodes requires a `label` and `id`.
+4. `relations`: to define the relation between the hierarchical parent nodes defined in `nodes` and the main node defined in `entity`, where each relation needs `label`, `from` and `to`.
+
+Example
+
+```yaml
+topic_mappings:
+- pattern: "{building}/{floor}/{room}/thermostat/{attribute}"
+	entity:
+		label: "Thermostat"                 
+		id: "{building}:{floor}:{room}:thermostat"    
+	properties:
+		mode: payload_as_field.      
+		field_name: "{attribute}"                   
+	nodes:                                                      
+		- label: "Building"
+		  id: "{building}"
+		- label: "Floor"
+		  id: "{building}:{floor}"
+		- label: "Room"
+		  id: "{building}:{floor}:{room}" 
+	relationships:                                                                                             - label: "HAS_FLOOR"                                      
+          from: "Building" ## node label
+          to: "Floor"          ## node label
+        - label: "HAS_ROOM"
+		  from: "Floor"
+          to: "Room"        
+		- label: "HAS_THREMOSTAT"
+		  from: "Room"
+		  to: "Thermostat"
+```
+
 #### Behavior
 
 Proposed sensor input shape:
@@ -459,6 +506,7 @@ if get_random_probability() < small_probability:
 
 return
 ```
+when using `Pattern based matching`, check if done for the parents of the main entity node and the relations between them `for each edge`
 
 **Advantages:**
 - **Lower effective full-path false positives**: All prefixes must pass before skipping schema emission.
@@ -484,6 +532,8 @@ For topic `building-011/floor-02/room-03/sensor-01`:
 1. Check Tree for `building-011/floor-02/room-03/sensor-01` → exists?
 
 If exists, schema emission is skipped, else, the schema is emitted to the query and added to the tree.
+
+when using `Pattern based matching`, no change is expected in the checking mechanism.
 
 **Advantages:**
 - **Minimal memory overhead**: ART is highly memory efficient (but less efficient than bloom-filters).
@@ -515,6 +565,8 @@ For topic `building-011/floor-02/room-03/sensor-01`:
 7. relation (3-4) (HashSet)
 
 this gives detailed picture of what exists in the indexes, enabling fine-controlled of the emitted hierarchy schema payload (so, we don't insert what is already existing). 
+
+when using `Pattern based matching`, no change is expected in the current mechanism.
 
 **Advantages:**
 - **Deterministic existence checks**: Not probabilistic.
@@ -553,7 +605,7 @@ JSON is the primary payload format in v1. Additional formats may be added later 
 
 #### MQTT protocol version
 
-v5 is the preferred implementation target because it offers better session and flow-control features while keeping practical compatibility with v3.1.1 broker ecosystems.
+v3.1.1 is the preferred implementation target because it understands v3.1.1 brokers, while being interoperable with v5 brokers
 
 #### Target brokers
 
@@ -607,7 +659,7 @@ pub enum MqttTransportMode {
 
 ## Compatibility impact
 
-- Compatible with brokers that support MQTT v5 and v3.1.1.
+- Compatible with MQTT v3.1.1 brokers and interoperable with MQTT v5 brokers.
 - No breaking changes expected for existing sources; this is an additive source type.
 - Query compatibility depends on selected mapping strategy (semantic labels vs generic level labels).
 
@@ -642,6 +694,13 @@ pub enum MqttTransportMode {
 
 <!-- Optional. Describe additional information supporting this design. For instance, describe the details of alternative design if you have one. -->
 
+## Note on Drasi Redesign & Reliability:
+This implementation acknowledges the upcoming architectural changes to the Drasi core. For V1, the MQTT Source operates on an at-most-once delivery guarantee.
+
+- Current Assumption: A local Write-Ahead Log (WAL) is not implemented in this iteration. This simplifies the initial scope and focuses on protocol interoperability and mapping logic.
+
+- Future Integration: Once the centralized durability framework is available in drasi-core, the MQTT Source will be integrated to support persistent state and "at-least-once" guarantees across restarts.
+
 ## References
 
 - https://www.hivemq.com/blog/mqtt-essentials-part-5-mqtt-topics-best-practices/
@@ -653,4 +712,3 @@ pub enum MqttTransportMode {
 - https://www.isa.org/standards-and-publications/isa-standards/isa-95-standard
 
 <!-- Optional. Add the design documents and references you use for this document. -->
-
