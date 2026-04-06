@@ -41,7 +41,7 @@ An analyst wants to query sensor hierarchy and values (Building → Floor → Ro
 1. Add an MQTT Source for drasi-core that subscribes to broker topics and emits Drasi `SourceChange` records.
 2. Support topic hierarchy mapping to graph elements so users can write meaningful Cypher/GQL queries.
 3. Support JSON payloads as the primary format with clear extension points for future formats.
-4. Support MQTT v5 as the primary protocol version while remaining compatible with MQTT v3.1.1 brokers.
+4. Support MQTT v3.1.1 as the primary protocol version, this achieves (maximum compatibility) as it understands MQTT v3.1.1 brokers and interoperable with MQTT v5 brokers.
 5. Validate interoperability with target brokers (Mosquitto and HiveMQ).
 
 ### Non-Goals
@@ -118,6 +118,12 @@ Example topic:
 ```text
 building-1/floor-1/room-2/sensor-1
 ```
+
+#### Quality of service (QoS)
+
+Quality of service can be set per topic subscription `client.subscribe(topic, qos)`, as a default `QoS` can be set to `1` for all subscriptions, while keeping `QoS::0` and `QoS::2` as options.
+
+With durable WAL being supported and enabled within MQTT source, `QoS::0` must be prevented and fallen back to `QoS::1`.
 
 #### Topic hierarchy guidance
 
@@ -285,7 +291,7 @@ query.process_source_change(SourceChange::Update {
 		metadata: ElementMetadata {
 			reference: ElementReference::new("mqtt", "building-1"),
 			labels: Arc::new([Arc::from("Building")]),
-			effective_from: 0,
+			effective_from: chrono::Utc::now().timestamp_nanos_opt().unwrap() as u64,
 		},
 		properties: ElementPropertyMap::from(json!({
 			"name": "building-1",
@@ -298,7 +304,7 @@ query.process_source_change(SourceChange::Update {
 		metadata: ElementMetadata {
 			reference: ElementReference::new("mqtt", "floor-1"),
 			labels: Arc::new([Arc::from("Floor")]),
-			effective_from: 0,
+			effective_from: chrono::Utc::now().timestamp_nanos_opt().unwrap() as u64,
 		},
 		properties: ElementPropertyMap::from(json!({
 			"name": "floor-1",
@@ -311,7 +317,7 @@ query.process_source_change(SourceChange::Update {
 		metadata: ElementMetadata {
 			reference: ElementReference::new("mqtt", "room-2"),
 			labels: Arc::new([Arc::from("Room")]),
-			effective_from: 0,
+			effective_from: chrono::Utc::now().timestamp_nanos_opt().unwrap() as u64,
 		},
 		properties: ElementPropertyMap::from(json!({
 			"name": "room-2",
@@ -324,7 +330,7 @@ query.process_source_change(SourceChange::Update {
 		metadata: ElementMetadata {
 			reference: ElementReference::new("mqtt", "building-1-has-floor-1"),
 			labels: Arc::new([Arc::from("HAS_FLOOR")]),
-			effective_from: 0,
+			effective_from: chrono::Utc::now().timestamp_nanos_opt().unwrap() as u64,
 		},
 		properties: ElementPropertyMap::new(),
 		out_node: ElementReference::new("mqtt", "building-1"),
@@ -337,7 +343,7 @@ query.process_source_change(SourceChange::Update {
 		metadata: ElementMetadata {
 			reference: ElementReference::new("mqtt", "floor-1-has-room-2"),
 			labels: Arc::new([Arc::from("HAS_ROOM")]),
-			effective_from: 0,
+			effective_from: chrono::Utc::now().timestamp_nanos_opt().unwrap() as u64,
 		},
 		properties: ElementPropertyMap::new(),
 		out_node: ElementReference::new("mqtt", "floor-1"),
@@ -350,7 +356,7 @@ query.process_source_change(SourceChange::Update {
 		metadata: ElementMetadata {
 			reference: ElementReference::new("mqtt", "room-2-has-sensor-1"),
 			labels: Arc::new([Arc::from("HAS_SENSOR")]),
-			effective_from: 0,
+			effective_from: chrono::Utc::now().timestamp_nanos_opt().unwrap() as u64,
 		},
 		properties: ElementPropertyMap::new(),
 		out_node: ElementReference::new("mqtt", "room-2"),
@@ -367,7 +373,7 @@ query.process_source_change(SourceChange::Update {
         metadata: ElementMetadata {
             reference: ElementReference::new("mqtt", "sensor-1"),
             labels: Arc::new([Arc::from("Sensor")]),
-            effective_from: 0,
+            effective_from: chrono::Utc::now().timestamp_nanos_opt().unwrap() as u64,
         },
         properties: ElementPropertyMap::from(json!({
             "type": "temperature",
@@ -524,6 +530,22 @@ this gives detailed picture of what exists in the indexes, enabling fine-control
 - the filter could start `cold`, and be `hot` while working.
 - disk-persistence and synchronization can be done in next versions.
 
+##### Configuration 
+
+`hierarchy` key can be used to define the chosen mechanism, with values:
+
+- `bloom` for using the first option of bloom-filter.
+- `art` (default to keep performance efficient, while preserving consistency) for using the second option of standard-simple ART.
+- `segmented-art` for using the third option of segmented-ART.
+- `none` for none of those options, directly emitting hierarchy to the continuos query.
+
+#### Bootstrapping
+
+MQTT retained messages are treated by default as a **native bootstrap mechanism** for this source. On startup or re-subscription, retained messages provide an initial snapshot of current topic state without requiring an external bootstrap flow.
+
+The source should also support Drasi's **pluggable bootstrap providers**. This keeps behavior consistent with other sources and allows operators to choose non-MQTT bootstrap strategies when needed (postgres - mssql).
+
+No MQTT-specific `BootstrapProvider` implementation is required. The MQTT source consumes retained messages natively and uses the existing Drasi bootstrap-provider extension model when an bootstrap source is configured.
 
 #### Data format
 
@@ -561,7 +583,24 @@ No new REST API is proposed in this design. The expected change is a new source 
 
 ## Security
 
-- Use secure broker connectivity (TLS) and support credential-based auth mechanisms.
+- Use secure broker connectivity (TLS/SSL), (TCP).
+
+```rust
+pub enum MqttTransportMode {
+    #[default]
+    TCP,
+    TLS {
+        /// ca certificate
+        ca: Vec<u8>,
+        /// alpn settings
+        alpn: Option<Vec<Vec<u8>>>,
+        /// tls client_authentication
+        client_auth: Option<(Vec<u8>, Vec<u8>)>, // mTLS 
+    },
+}
+```
+- Add support for identity provider authentication trait `IdentityProvider`, this unlocks the usage of `AwsIdentityProvider`, `AzureIdentityProvider`, and `PasswordIdentityProvider` (traditional username and password authentication).
+
 - Validate and safely parse payloads to prevent malformed-input failures.
 
 <!-- Optional. Use this section to describe the security threats and its mitigations with this design---such as authenticating request, storing secrets and credentials, etc. -->
