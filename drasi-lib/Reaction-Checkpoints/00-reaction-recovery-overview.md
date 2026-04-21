@@ -84,3 +84,14 @@ Recovery flows are dictated by the Reaction's archetype (State Synchronization v
 - **New Reaction (Event Trigger)**: Skip snapshot → save current sequence as checkpoint → open live gate.
 - **Restart (No Gap)**: read state checkpoint → `fetch_outbox(checkpoint)` → process entries → open live gate.
 - **Restart (Gap Detected)**: Reaction calls `fetch_outbox(checkpoint)` and receives `PositionUnavailable`. Executes its `recovery_policy` (`strict`, `auto_reset`, or `auto_skip_gap`) based on the plugin's designed behavior.
+
+## 7. Out of Scope
+
+This design assumes single-instance `DrasiLib` deployments. Horizontal scale-out and HA (multiple drasi-lib processes sharing a query or reaction against shared storage) are out of scope. A separate design would be required to coordinate:
+
+- Distributed source subscription without duplicate processing.
+- Outbox sequence allocation across processes.
+- `live_results` consistency under concurrent writers.
+- Reaction-checkpoint coordination across replicas.
+
+Deploying multiple instances against shared persistent storage without such coordination produces silent data corruption and is unsupported.

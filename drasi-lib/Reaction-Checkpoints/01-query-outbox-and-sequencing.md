@@ -158,3 +158,13 @@ pub trait LiveResultsWriter: Send + Sync {
 Evaluated once via `index_factory.is_volatile(&storage_backend)`:
 - **`persistence_enabled = true`**: Storage namespaces written inside transaction. `QueryOutputState` restored from disk.
 - **`persistence_enabled = false`**: Core internal transactions only. Zero disk I/O. `QueryOutputState` starts empty and resets to 0 on restart.
+
+## 8. Observability
+
+Observability is framework-provided. Three categories of operator-visible signals are committed to; specific metric names, label cardinality, and histogram buckets are finalized in the implementation PRs that land each mechanism.
+
+- **Per-query**: outbox size and sequence bounds, `last_result_seq` advance rate, `live_results` cardinality, outer-transaction duration, and snapshot-lifetime metrics (active snapshot clones, oldest snapshot age, mutations accumulated since the oldest snapshot was taken).
+- **Per-reaction (per subscribed query)**: checkpoint sequence and lag, framework-level dedup skip count, gap-detection count, recovery-policy trigger counts by variant, and `fetch_snapshot` / `fetch_outbox` invocation counts.
+- **Lifecycle events**: startup rejections (durable-on-volatile-query, durable-on-non-durable-store, invalid archetype and policy pairs), AutoReset completions, hash-mismatch counts.
+
+These exist because the framework deliberately does not self-heal certain failure modes (stuck snapshots, consumer gaps, misconfiguration). Making them visible is the contract.
