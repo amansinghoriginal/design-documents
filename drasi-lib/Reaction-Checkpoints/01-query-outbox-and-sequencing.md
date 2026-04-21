@@ -8,18 +8,21 @@
 
 A monotonic `u64` counter (`last_result_seq`) tracking emitted query results. Maintained in memory for all queries, and persisted in the `stream_state` CF for persistent queries.
 
+**(Note on existing `ResultSequenceCounter` in `drasi-core`):** Drasi-Lib uses this new `last_result_seq` orchestration in its outer transaction rather than the core `ResultSequenceCounter` trait. The core trait is left untouched because `drasi-platform` (a separate project that consumes drasi-core and predates Drasi-Lib) depends on it. It remains completely separate from Drasi-Lib's outbox machinery.
+
 - Increments only when diffs are non-empty.
 - Applies equally to source-event diffs and time-triggered `process_due_futures` diffs.
 - Uses `config_hash` verification on startup: matching hash resumes from persisted sequence, mismatch resets to `0`.
 
 ## 2. In-Memory `QueryOutputState`
 
-All read operations (`fetch_snapshot`, `fetch_outbox`) are served from this unified struct behind an `RwLock`:
+All read operations (`fetch_snapshot`, `fetch_outbox`) are served from this unified struct behind an `RwLock`. To allow non-blocking snapshots, the result set uses structural sharing (`im::HashMap`).
 
 ```rust
 pub struct QueryOutputState {
-    /// Live result set, keyed by row_signature for O(1) diff application.
-    pub results: HashMap<u64, serde_json::Value>,
+    /// Live result set, keyed by row_signature. 
+    /// Uses `im::HashMap` for O(1) lock-free snapshot cloning.
+    pub results: im::HashMap<u64, serde_json::Value>,
     /// The result sequence number the snapshot reflects.
     pub as_of_sequence: u64,
     /// Ring buffer of recent QueryResults (max configurable entries).
@@ -28,7 +31,13 @@ pub struct QueryOutputState {
 ```
 
 **Write Path (Query Processor):**
-After a successful DB commit, a write lock is acquired to apply the non-empty diffs (O(1) dictionary updates), increment `as_of_sequence`, and push/pop the `outbox` ring buffer.
+After a successful DB commit, a write lock is acquired to apply the non-empty diffs, increment `as_of_sequence`, and push/pop the `outbox` ring buffer. While `im::HashMap` allocates new nodes on mutation, it shares the vast majority of the tree with previous states, keeping updates fast.
+
+**Read Path (fetch_snapshot):**
+The API acquires the read lock, calls `.clone()` on the `results` map (which is a near-instant $O(1)$ operation), captures `as_of_sequence`, and immediately releases the lock. It can then safely convert the immutable clone into a paginated `Stream` to serve downstream Reactions incrementally, ensuring the Query Processor is never blocked by a slow Reaction.
+
+**Snapshot Lifetime:**
+A snapshot is a transient, one-shot resource: a reaction consumes it during bootstrap or gap recovery and then drops it. Memory retained while a snapshot is held scales with the number of row mutations landing during the snapshot's lifetime (via HAMT copy-on-write), not with the total view size. The framework exposes observability (snapshot age and accumulated mutations per query) rather than imposing timeouts; stuck or leaked snapshots are surfaced to operators for intervention.
 
 **Startup (Crash Recovery):**
 For persistent queries, `QueryOutputState` is hydrated by reading the `live_results` CF, `outbox` CF, and `stream_state` sequence upon initialization.
@@ -55,42 +64,80 @@ Note: The old `snapshot_sequence` is perfectly in sync with `result_sequence` in
 
 ## 4. Extended Transaction Scope
 
-Both `process_source_change` and `process_due_futures` execution paths are wrapped in the outer transaction:
+Both `process_source_change` and `process_due_futures` execution paths are wrapped in the outer transaction. The two paths differ only in whether a source checkpoint is staged:
 
+**`process_source_change` path:**
 ```text
 Lib:    session_control.begin()
 Core:     ...index writes...
-Lib:    checkpoint_writer.stage_checkpoint(src, seq) 
+Lib:    checkpoint_writer.stage_checkpoint(src, seq)    <- source-specific
 Lib:    if !diffs.is_empty():
           checkpoint_writer.stage_result_sequence(++last_result_seq)
           outbox_writer.append(last_result_seq, QueryResult)
           live_results_writer.apply_diffs(diffs)
 Lib:    session_control.commit() [Atomic DB Commit]
+```
+
+**`process_due_futures` path:**
+```text
+Lib:    session_control.begin()
+Core:     ...index writes (future queue pop + re-evaluation)...
+Lib:    [NO source checkpoint staged — futures have no source sequence]
+Lib:    if !diffs.is_empty():
+          checkpoint_writer.stage_result_sequence(++last_result_seq)
+          outbox_writer.append(last_result_seq, QueryResult)
+          live_results_writer.apply_diffs(diffs)
+Lib:    session_control.commit() [Atomic DB Commit]
+```
+
+**Note**: The [Source Recovery design](../source-recovery/02.md) states that `process_due_futures` does not need source checkpoint staging (future events are internally generated with no source sequence). The outer transaction wrapping here is purely for outbox and live_results atomicity. Both designs are consistent — they address different concerns within the same transaction.
 
 Lib:    { query_output.write() → update QueryOutputState }
 Lib:    dispatch_query_result(...) // into live channel
 ```
 If the event fails, `session_control.rollback()` drops all CF writes, leaving memory and DB state intact.
 
+**Transaction size**: The outer transaction includes core's index writes, source checkpoint, result sequence, one outbox append (serialized QueryResult), and one `live_results` write per diff. For typical leaf-node source changes (1-3 diffs), this adds minimal overhead. Hub-node changes in fan-out query patterns can produce O(degree) diffs and proportionally larger transactions. These are infrequent spikes; all writes go into a single WriteBatch/MULTI with one fsync regardless of batch size, so the cost is serialization CPU, not additional disk I/O.
+
 ## 5. Dual Bootstrap APIs
 
 `Query` trait extended to replace `as_any()` reflection hacks:
 
 ```rust
+pub struct OutboxResponse {
+    pub results: Vec<QueryResult>,
+    pub latest_sequence: u64,
+    pub config_hash: u64,
+}
+
+pub enum OutboxError {
+    PositionUnavailable {
+        requested: u64,
+        earliest_available: u64,
+        latest_sequence: u64,
+        config_hash: u64,
+    }
+}
+
 pub trait Query: Send + Sync {
     // ... existing ...
     async fn fetch_snapshot(&self) -> SnapshotResponse;
-    async fn fetch_outbox(&self, after_sequence: Option<u64>) -> Vec<QueryResult>;
+    async fn fetch_outbox(&self, after_sequence: u64) -> Result<OutboxResponse, OutboxError>;
 }
 ```
 
-- **`fetch_snapshot`**: Returns `state.results.values()` and `state.as_of_sequence`.
-- **`fetch_outbox`**: Returns `state.outbox` entries logically filtered by `> after_sequence`.
+- **`fetch_snapshot`**: Returns `state.results.values()` and `state.as_of_sequence`. If the query is still bootstrapping (status `Starting`), the call blocks until the query's bootstrap gate opens. This prevents reactions from receiving partially-populated state during source recovery or initial bootstrap.
+- **`fetch_outbox`**: Returns successfully with bounded entries if `after_sequence + 1` is still in the ring buffer, otherwise fails with `PositionUnavailable`. Same bootstrap-blocking behavior as `fetch_snapshot`. Note that because outbox capacities are naturally bounded (e.g., 10,000 items), returning the full contiguous `Vec` safely fits within memory bounds (10-100MB), avoids prolonged `RwLock` contention, and keeps plugin APIs simple without needing pagination.
 
 ## 6. API & Structural Changes
 
-**`ResultDiff`** gains `row_signature: u64` derived from core evaluation bindings context.
 **`QueryResult`** gains `sequence: u64` natively.
+
+**`ResultDiff`** gains `row_signature: u64`. Core already stamps this on every `QueryPartEvaluationContext` variant (from the path-solver binding for non-aggregating rows, the grouping-key hash for aggregations). Lib's remaining work is to propagate it through the core-to-lib conversion and to key `QueryOutputState.results` on it.
+
+When an aggregation's grouping key changes, core emits two aggregation contexts (old group, new group), each with its own signature. Lib must keep these as two distinct `live_results` operations rather than collapsing them.
+
+When an aggregation's `after` equals the group's identity value (`count: 0`, `sum: 0`, `avg: null`, `min`/`max: null`, `collect: []`), the group has emptied and its `live_results` entry must be deleted rather than overwritten with the identity value. This requires `ResultDiff::Aggregation` to carry enough information for lib to distinguish a real value from the identity, either by preserving core's default-detection signal or by emitting the diff as an explicit removal. Depends on drasi-project/drasi-core#384.
 
 **Writer Traits** implemented by index plugins:
 ```rust
