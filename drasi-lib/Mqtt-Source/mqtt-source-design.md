@@ -226,8 +226,18 @@ it will have 4 sections
 
 `inject`: (can be used with any of the `payload_as_field` or `payload_spread` options) Allows the user to manually insert topic variables (like {floor}) into the node's properties alongside the payload data for better query context.
 
+`inject_id`: (can be used with any of the `payload_as_field` or `payload_spread` options) Allows the user to inject the entity `id` to its properties, this enables filtering on the `id` within the queries (Note: the ids of the `nodes` and `relationships` are always injected within the properties of the element).
+
+Sample possible query:
+```
+            MATCH (rd:DEVICE)-[:LOCATED_IN_ROOM]->(r:ROOM)-[:LOCATED_IN_FLOOR]->(f:FLOOR)
+            WHERE rd.id = 'r1:d2' AND r.id = 'r1' AND f.id = 'f2'
+            RETURN rd.reading as val
+```
+
+
 3. `nodes`: to define the hierarchical parent nodes used in relations, where every nodes requires a `label` and `id`.
-4. `relations`: to define the relation between the hierarchical parent nodes defined in `nodes` and the main node defined in `entity`, where each relation needs `label`, `from` and `to`,
+4. `relationships`: to define relations between nodes, where each relationship needs `label`, `id`, `from`, and `to`. Both `from` and `to` are objects of shape `{ label, id }`. Templates in `id` can mix topic variables (e.g., `{room}`) and JSONPath payload references (e.g., `$.gateway_id`), regardless of payload mode. The `label` on `from`/`to` lets the source upsert the endpoint node with the correct label even when it is not declared in the `nodes` section (e.g., a node whose id comes from the payload).
 
 Note, nodes specified in `nodes` section but can't access the main entity node using any path can be ignored (whenever ignoring it increases the efficieny).
 
@@ -240,7 +250,7 @@ topic_mappings:
 		label: "Thermostat"                 
 		id: "{building}:{floor}:{room}:thermostat"    
 	properties:
-		mode: payload_as_field.      
+		mode: payload_as_field
 		field_name: "{attribute}"                   
 	nodes:                                                      
 		- label: "Building"
@@ -250,18 +260,18 @@ topic_mappings:
 		- label: "Room"
 		  id: "{building}:{floor}:{room}" 
 	relationships:
-        - label: "HAS_FLOOR"                                      
-          from: "Building" ## node label
-          to: "Floor"          ## node label
+		- label: "HAS_FLOOR"
 		  id: "{building}_has_floor_{floor}"
-        - label: "HAS_ROOM"
-		  from: "Floor"
-          to: "Room"        
+		  from: { label: "Building", id: "{building}" }
+		  to:   { label: "Floor",    id: "{building}:{floor}" }
+		- label: "HAS_ROOM"
 		  id: "{floor}_has_room_{room}"
-		- label: "HAS_THREMOSTAT"
-		  from: "Room"
-		  to: "Thermostat"
-		  id: "{room}_has_sensor_thermostat"
+		  from: { label: "Floor", id: "{building}:{floor}" }
+		  to:   { label: "Room",  id: "{building}:{floor}:{room}" }
+		- label: "HAS_THERMOSTAT"
+		  id: "{room}_has_thermostat"
+		  from: { label: "Room",       id: "{building}:{floor}:{room}" }
+		  to:   { label: "Thermostat", id: "{building}:{floor}:{room}:thermostat" }
 ```
 
 #### Behavior
@@ -526,7 +536,7 @@ For topic `building-011/floor-02/room-03/sensor-01`:
 
 this gives detailed picture of what exists in the indexes, enabling fine-controlled of the emitted hierarchy schema payload (so, we don't insert what is already existing). 
 
-when using `Pattern based matching`, we will store for each node (ids) and relation (specified in the `nodes` and `relations` sections) instead of for each segment (basically mapping is done before the segmented-ART step).
+when using `Pattern based matching`, we will store for each node (ids) and relation (specified in the `nodes` and `relationships` sections) instead of for each segment (basically mapping is done before the segmented-ART step).
 
 **Advantages:**
 - **Deterministic existence checks**: Not probabilistic.
